@@ -1,0 +1,74 @@
+services:
+  fastapi:
+    build: .
+    ports:
+      - "8000:8000"
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Europe/Moscow
+    env_file:
+      - .env
+    depends_on:
+      - db
+    networks:
+      - app-network
+
+  celery_worker:
+    build: .
+    command: celery -A notifier worker --loglevel=info
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Europe/Moscow
+    depends_on:
+      - db
+      - redis
+    env_file:
+      - .env
+    networks:
+      - app-network
+
+  celery_beat:
+    build: .
+    command: celery -A notifier beat --loglevel=info --scheduler celery.beat:PersistentScheduler
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Europe/Moscow
+    depends_on:
+      - db
+      - redis
+      - celery_worker
+    env_file:
+      - .env
+    networks:
+      - app-network
+
+  redis:
+    image: redis:7
+    ports:
+      - "6380:6379"
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    networks:
+      - app-network
+
+  db:
+    image: postgres:13
+    ports:
+      - "5433:5432"  
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    environment: 
+        - POSTGRES_DB=schedulehelper
+        - POSTGRES_USER=Zkuzmine
+        - POSTGRES_PASSWORD=V_6EuFAlktZcZyp
+    restart: always
+    networks:
+    - app-network
+
+volumes:
+  postgres-data:
+    driver: local
+
+networks:
+  app-network:
+    driver: bridge

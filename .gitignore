@@ -1,0 +1,5 @@
+/.env
+/.venv
+/1
+/docker-compose.yml.bak
+/schedule.zip
