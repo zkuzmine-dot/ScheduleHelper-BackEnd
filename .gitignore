@@ -3,3 +3,19 @@
 /1
 /docker-compose.yml.bak
 /schedule.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Tests & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Certificates & secrets
+nginx/certs/
+.gitignore
+.claude
+__pycache__/main.cpython-313.pyc
