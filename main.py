@@ -1,4 +1,7 @@
 import html
+import hmac
+import hashlib
+from urllib.parse import parse_qsl
 from fastapi import FastAPI, Depends, HTTPException, status, Request, WebSocket, WebSocketDisconnect, Query, Body
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -220,7 +223,7 @@ async def add_x_forwarded_proto(request: Request, call_next):
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8080", "http://localhost:5173", "http://127.0.0.1:5500"],
+    allow_origins=["http://localhost:8080", "http://localhost:5173", "http://127.0.0.1:5500","https://schedulefrontend.timeofthestars.online"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -568,6 +571,67 @@ async def login_for_access_token(
         "refresh_token": refresh_token,
         "token_type": "bearer"
     }
+
+def verify_telegram_init_data(init_data: str) -> dict | None:
+    """Верифицирует Telegram WebApp initData через HMAC-SHA256, возвращает user dict если валидно"""
+    try:
+        parsed = dict(parse_qsl(init_data, keep_blank_values=True))
+        received_hash = parsed.pop("hash", None)
+        if not received_hash:
+            return None
+
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+
+        secret_key = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).digest()
+        expected_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+        if not hmac.compare_digest(expected_hash, received_hash):
+            return None
+
+        return json.loads(parsed.get("user", "{}"))
+    except Exception as e:
+        logger.error(f"Telegram initData verification error: {e}")
+        return None
+
+
+@app.post("/token/telegram", response_model=TokenResponse)
+async def telegram_login(
+    init_data: str = Body(..., embed=True),
+    db: Session = Depends(get_db)
+):
+    tg_user = verify_telegram_init_data(init_data)
+    if not tg_user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Недействительные данные Telegram"
+        )
+
+    telegram_id = tg_user.get("id")
+    if not telegram_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Telegram ID не найден в данных"
+        )
+
+    user = db.query(UserDB).filter(UserDB.telegram_id == telegram_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Пользователь с таким Telegram не зарегистрирован. Обратитесь к администратору."
+        )
+
+    user.last_login = to_utc(datetime.now(MOSCOW_TZ))
+    db.commit()
+
+    access_token = create_access_token(data={"sub": user.username})
+    refresh_token = create_refresh_token(data={"sub": user.username})
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
+
 
 @app.post("/users/", response_model=UserResponse)
 async def create_user(user: UserCreate, current_user: UserDB = Depends(get_current_admin), db: Session = Depends(get_db)):
