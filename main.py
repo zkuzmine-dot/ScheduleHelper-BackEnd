@@ -661,14 +661,14 @@ async def create_user(user: UserCreate, current_user: UserDB = Depends(get_curre
     db.commit()                                      # ← сохраняем пользователя
 
     # ====================== АВТОМАТИЧЕСКОЕ СОЗДАНИЕ БЕСЕДЫ ГРУППЫ ======================
-    if user.role == "student" and user.group_number:
-        # Проверяем, первый ли это студент в группе
-        student_count = db.query(UserDB).filter(
+    if user.role in ("student", "group_leader") and user.group_number:
+        # Проверяем, первый ли это студент/староста в группе
+        member_count = db.query(UserDB).filter(
             UserDB.group_number == user.group_number,
-            UserDB.role == "student"
+            UserDB.role.in_(["student", "group_leader"])
         ).count()
 
-        if student_count == 1:  # Это первый студент → создаём беседу
+        if member_count == 1:  # Это первый участник группы → создаём беседу
             room_id = f"group:{user.group_number}"
             room_key = get_or_create_room_key(room_id, db)
             welcome_content = (
@@ -684,7 +684,7 @@ async def create_user(user: UserCreate, current_user: UserDB = Depends(get_curre
             )
             db.add(welcome_message)
             db.commit()  # сохраняем системное сообщение
-            logger.info(f"Создана беседа группы {user.group_number} (первый студент: {user.username})")
+            logger.info(f"Создана беседа группы {user.group_number} (первый участник: {user.username})")
 
     db.refresh(db_user)  # ← теперь можно безопасно обновить объект
     
