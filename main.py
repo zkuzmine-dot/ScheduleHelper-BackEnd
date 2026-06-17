@@ -1292,10 +1292,21 @@ def check_room_access(room_id: str, current_user: UserDB, db: Session) -> bool:
             if current_user.id not in (user1, user2):
                 return False
 
-            # Один из участников обязательно должен быть преподавателем
             users = db.query(UserDB).filter(UserDB.id.in_([user1, user2])).all()
-            roles = [u.role for u in users]
-            return "teacher" in roles
+            if len(users) != 2:
+                return False
+            u_a, u_b = users[0], users[1]
+            roles = {u_a.role, u_b.role}
+
+            # Один из участников — преподаватель или админ (покрывает: студент-препод, препод-препод, препод-админ)
+            if "teacher" in roles or "admin" in roles:
+                return True
+
+            # Студент/старший <-> старшина своей же группы
+            if "group_leader" in roles and u_a.group_number is not None and u_a.group_number == u_b.group_number:
+                return True
+
+            return False
 
         except:
             return False
@@ -1421,28 +1432,143 @@ async def get_my_chats(
             "unread": 0
         })
 
-    # 3. Личные чаты со всеми преподавателями
-    if current_user.role in ["student", "group_leader"]:
-        teachers = db.query(UserDB).filter(UserDB.role == "teacher").all()
-        
-        for teacher in teachers:
-            user1 = min(current_user.id, teacher.id)
-            user2 = max(current_user.id, teacher.id)
-            
-            display_name = teacher.full_name.strip() if teacher.full_name else teacher.username
-            
+    # 3. Старшина группы — всегда виден студенту/старосте своей группы, даже без переписки
+    if current_user.role in ["student", "group_leader"] and current_user.group_number:
+        leader = db.query(UserDB).filter(
+            UserDB.role == "group_leader",
+            UserDB.group_number == current_user.group_number,
+            UserDB.id != current_user.id
+        ).first()
+        if leader:
+            user1 = min(current_user.id, leader.id)
+            user2 = max(current_user.id, leader.id)
+            display_name = leader.full_name.strip() if leader.full_name else leader.username
             chats.append({
                 "room_id": f"private:{user1}_{user2}",
-                "name": display_name,                    # ← ФИО преподавателя
+                "name": f"{display_name} (староста)",
                 "type": "private",
-                "teacher_id": teacher.id,
+                "leader_id": leader.id,
                 "unread": 0
             })
 
-    # Сортировка: сначала группа, потом личные чаты
-    chats.sort(key=lambda x: 0 if x["type"] == "group" else 1)
+    # 4. Личные чаты — показываем только те, где уже есть переписка
+    partners = []
+    if current_user.role in ["student", "group_leader"]:
+        partners = db.query(UserDB).filter(UserDB.role.in_(["teacher", "admin"])).all()
+    elif current_user.role in ["teacher", "admin"]:
+        partners = db.query(UserDB).filter(
+            UserDB.role.in_(["student", "group_leader", "teacher"]),
+            UserDB.id != current_user.id
+        ).all()
+
+    if partners:
+        partner_by_room = {}
+        for partner in partners:
+            user1 = min(current_user.id, partner.id)
+            user2 = max(current_user.id, partner.id)
+            partner_by_room[f"private:{user1}_{user2}"] = partner
+
+        active_room_ids = {
+            row[0] for row in db.query(Message.room_id)
+                .filter(Message.room_id.in_(list(partner_by_room.keys())))
+                .distinct()
+                .all()
+        }
+
+        existing_room_ids = {c["room_id"] for c in chats}
+
+        for room_id, partner in partner_by_room.items():
+            if room_id not in active_room_ids or room_id in existing_room_ids:
+                continue
+
+            display_name = partner.full_name.strip() if partner.full_name else partner.username
+
+            if current_user.role in ["student", "group_leader"]:
+                chats.append({
+                    "room_id": room_id,
+                    "name": display_name,
+                    "type": "private",
+                    "teacher_id": partner.id,
+                    "unread": 0
+                })
+            elif partner.role == "teacher":
+                chats.append({
+                    "room_id": room_id,
+                    "name": display_name,
+                    "type": "private",
+                    "teacher_id": partner.id,
+                    "unread": 0
+                })
+            else:
+                label = f"{display_name} ({partner.group_number})" if partner.group_number else display_name
+                chats.append({
+                    "room_id": room_id,
+                    "name": label,
+                    "type": "private",
+                    "student_id": partner.id,
+                    "unread": 0
+                })
+
+    # Сортировка: сначала группа, потом общий чат, потом личные
+    type_order = {"group": 0, "teachers": 1, "private": 2}
+    chats.sort(key=lambda x: type_order.get(x["type"], 3))
 
     return chats
+
+
+@app.get("/chat/contacts")
+async def get_chat_contacts(
+    query: str | None = None,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Список людей, с которыми можно начать новый личный чат (для поиска собеседника)"""
+    results = []
+
+    if current_user.role in ["student", "group_leader"]:
+        q = db.query(UserDB).filter(UserDB.role.in_(["teacher", "admin"]))
+        if query:
+            like = f"%{query}%"
+            q = q.filter((UserDB.full_name.ilike(like)) | (UserDB.username.ilike(like)))
+        contacts = q.all()
+
+        for c in contacts:
+            user1, user2 = min(current_user.id, c.id), max(current_user.id, c.id)
+            display_name = c.full_name.strip() if c.full_name else c.username
+            results.append({
+                "user_id": c.id,
+                "room_id": f"private:{user1}_{user2}",
+                "name": display_name,
+                "subtitle": c.department,
+            })
+
+    elif current_user.role in ["teacher", "admin"]:
+        q = db.query(UserDB).filter(
+            UserDB.role.in_(["student", "group_leader", "teacher"]),
+            UserDB.id != current_user.id
+        )
+        if query:
+            like = f"%{query}%"
+            q = q.filter(
+                (UserDB.full_name.ilike(like)) |
+                (UserDB.username.ilike(like)) |
+                (UserDB.group_number.ilike(like))
+            )
+        contacts = q.all()
+
+        for c in contacts:
+            user1, user2 = min(current_user.id, c.id), max(current_user.id, c.id)
+            display_name = c.full_name.strip() if c.full_name else c.username
+            subtitle = c.group_number if c.role in ("student", "group_leader") else (c.department or "Преподаватель")
+            results.append({
+                "user_id": c.id,
+                "room_id": f"private:{user1}_{user2}",
+                "name": display_name,
+                "subtitle": subtitle,
+            })
+
+    results.sort(key=lambda x: x["name"])
+    return results
 
 
 class ConnectionManager:
@@ -1465,11 +1591,17 @@ class ConnectionManager:
         self.active_users[room_id].add(user_tuple)
         self.active_connections[room_id].append(websocket)
 
-    def disconnect(self, websocket: WebSocket, room_id: str, user: UserDB):
+        await self.broadcast_online(room_id)
+
+    async def disconnect(self, websocket: WebSocket, room_id: str, user: UserDB):
         """Отключаем пользователя"""
+        changed = False
+
         if room_id in self.active_users:
             user_tuple = (user.id, user.username, user.full_name or user.username)
-            self.active_users[room_id].discard(user_tuple)
+            if user_tuple in self.active_users[room_id]:
+                self.active_users[room_id].discard(user_tuple)
+                changed = True
 
             # Если в комнате больше никого нет — удаляем комнату
             if not self.active_users[room_id]:
@@ -1482,6 +1614,16 @@ class ConnectionManager:
                 pass
             if not self.active_connections[room_id]:
                 del self.active_connections[room_id]
+
+        if changed:
+            await self.broadcast_online(room_id)
+
+    def get_online_list(self, room_id: str) -> list[dict]:
+        users = self.active_users.get(room_id, set())
+        return [{"user_id": uid, "username": un, "full_name": fn} for uid, un, fn in users]
+
+    async def broadcast_online(self, room_id: str):
+        await self.broadcast({"type": "online_users", "users": self.get_online_list(room_id)}, room_id)
 
     async def broadcast(self, message: dict, room_id: str):
         """Рассылаем обычное сообщение всем в комнате"""
@@ -1592,14 +1734,14 @@ async def websocket_endpoint(
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket: User {current_user.username} disconnected from room {room}")
-        manager.disconnect(websocket, room, current_user)
+        await manager.disconnect(websocket, room, current_user)
 
     except Exception as e:
         logger.error(f"WebSocket error for user {current_user.username} in room {room}: {e}")
-        manager.disconnect(websocket, room, current_user)
+        await manager.disconnect(websocket, room, current_user)
 
     finally:
-        manager.disconnect(websocket, room, current_user)
+        await manager.disconnect(websocket, room, current_user)
 
 # ====================== СПИСОК ПРЕПОДАВАТЕЛЕЙ ДЛЯ СТУДЕНТА ======================
 
