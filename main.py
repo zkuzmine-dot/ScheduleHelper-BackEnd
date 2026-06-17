@@ -669,12 +669,18 @@ async def create_user(user: UserCreate, current_user: UserDB = Depends(get_curre
         ).count()
 
         if student_count == 1:  # Это первый студент → создаём беседу
+            room_id = f"group:{user.group_number}"
+            room_key = get_or_create_room_key(room_id, db)
+            welcome_content = (
+                f"👋 Беседа группы {user.group_number} успешно создана!\n\n"
+                f"Здесь можно обсуждать расписание, домашку, вопросы к преподавателям и всё остальное."
+            )
             welcome_message = Message(
-                room_id=f"group:{user.group_number}",
+                room_id=room_id,
                 sender_id=None,
                 sender_username="Система",
-                content=f"👋 Беседа группы **{user.group_number}** успешно создана!\n\n"
-                        f"Здесь можно обсуждать расписание, домашку, вопросы к преподавателям и всё остальное."
+                content=encrypt_content(welcome_content, room_key),
+                is_encrypted=True
             )
             db.add(welcome_message)
             db.commit()  # сохраняем системное сообщение
