@@ -181,6 +181,7 @@ class Message(Base):
     content = Column(Text, nullable=False)
     is_encrypted = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    edited_at = Column(DateTime(timezone=True), nullable=True)
 
     # Связь с пользователем (для удобства)
     sender = relationship("UserDB", foreign_keys=[sender_id], back_populates="sent_messages")
@@ -359,6 +360,7 @@ class MessageResponse(BaseModel):
     sender_full_name: str | None
     content: str
     created_at: str
+    edited_at: str | None = None
 
 class TeacherResponse(BaseModel):
     id: int
@@ -1398,7 +1400,8 @@ async def get_chat_history(
                 sender_username=m.sender_username,
                 sender_full_name=m.sender_full_name,
                 content=content,                    # ← расшифрованное содержимое
-                created_at=to_moscow(m.created_at).isoformat()
+                created_at=to_moscow(m.created_at).isoformat(),
+                edited_at=to_moscow(m.edited_at).isoformat() if m.edited_at else None
             )
         )
 
@@ -1682,55 +1685,116 @@ async def websocket_endpoint(
     try:
         while True:
             data = await websocket.receive_json()
-            raw_content = data.get("content", "").strip()
+            action = data.get("action", "send")
 
-            # === ЗАЩИТА 1: Пустые сообщения ===
-            if not raw_content:
-                await websocket.send_json({
-                    "type": "error", 
-                    "content": "Сообщение не может быть пустым"
-                })
-                continue
+            # === ОТПРАВКА НОВОГО СООБЩЕНИЯ ===
+            if action == "send":
+                raw_content = data.get("content", "").strip()
 
-            # === ЗАЩИТА 2: Rate Limit ===
-            if not await check_chat_rate_limit(current_user.id):
-                await websocket.send_json({
-                    "type": "error",
-                    "content": "Вы отправляете сообщения слишком часто. Подождите немного."
-                })
-                continue
+                if not raw_content:
+                    await websocket.send_json({
+                        "type": "error",
+                        "content": "Сообщение не может быть пустым"
+                    })
+                    continue
 
-            # Очистка от XSS
-            content = sanitize_message(raw_content)
+                if not await check_chat_rate_limit(current_user.id):
+                    await websocket.send_json({
+                        "type": "error",
+                        "content": "Вы отправляете сообщения слишком часто. Подождите немного."
+                    })
+                    continue
 
-            # === ШИФРОВАНИЕ СООБЩЕНИЯ ===
-            encrypted_content = encrypt_content(content, room_key)
+                content = sanitize_message(raw_content)
+                encrypted_content = encrypt_content(content, room_key)
 
-            # Формируем сообщение для отправки клиентам (расшифрованное)
-            message = {
-                "type": "message",
-                "room_id": room,
-                "sender_id": current_user.id,
-                "sender_username": current_user.username,
-                "sender_full_name": current_user.full_name or current_user.username,
-                "content": content,                    # клиенту отправляем открытый текст
-                "created_at": datetime.now(MOSCOW_TZ).isoformat()
-            }
+                db_message = Message(
+                    room_id=room,
+                    sender_id=current_user.id,
+                    sender_username=current_user.username,
+                    sender_full_name=current_user.full_name or current_user.username,
+                    content=encrypted_content,             # ← сохраняем зашифрованное
+                    is_encrypted=True
+                )
+                db.add(db_message)
+                db.commit()
+                db.refresh(db_message)
 
-            # Сохраняем в базу ЗАШИФРОВАННОЕ сообщение
-            db_message = Message(
-                room_id=room,
-                sender_id=current_user.id,
-                sender_username=current_user.username,
-                sender_full_name=current_user.full_name or current_user.username,
-                content=encrypted_content,             # ← сохраняем зашифрованное
-                is_encrypted=True
-            )
-            db.add(db_message)
-            db.commit()
+                message = {
+                    "type": "message",
+                    "id": db_message.id,
+                    "room_id": room,
+                    "sender_id": current_user.id,
+                    "sender_username": current_user.username,
+                    "sender_full_name": current_user.full_name or current_user.username,
+                    "content": content,                    # клиенту отправляем открытый текст
+                    "created_at": to_moscow(db_message.created_at).isoformat()
+                }
 
-            # Рассылаем сообщение всем участникам комнаты
-            await manager.broadcast(message, room)
+                await manager.broadcast(message, room)
+
+            # === РЕДАКТИРОВАНИЕ СООБЩЕНИЯ (только своё, в течение 24 часов) ===
+            elif action == "edit":
+                message_id = data.get("message_id")
+                new_content_raw = (data.get("content") or "").strip()
+
+                if not message_id or not new_content_raw:
+                    await websocket.send_json({"type": "error", "content": "Некорректные данные для редактирования"})
+                    continue
+
+                db_message = db.query(Message).filter(Message.id == message_id, Message.room_id == room).first()
+                if not db_message:
+                    await websocket.send_json({"type": "error", "content": "Сообщение не найдено"})
+                    continue
+
+                if db_message.sender_id != current_user.id:
+                    await websocket.send_json({"type": "error", "content": "Нельзя редактировать чужое сообщение"})
+                    continue
+
+                created_at = db_message.created_at
+                if created_at.tzinfo is None:
+                    created_at = pytz.UTC.localize(created_at)
+                if datetime.now(pytz.UTC) - created_at > timedelta(hours=24):
+                    await websocket.send_json({"type": "error", "content": "Редактирование доступно только в течение 24 часов после отправки"})
+                    continue
+
+                new_content = sanitize_message(new_content_raw)
+                db_message.content = encrypt_content(new_content, room_key)
+                db_message.edited_at = to_utc(datetime.now(MOSCOW_TZ))
+                db.commit()
+
+                await manager.broadcast({
+                    "type": "message_edited",
+                    "id": db_message.id,
+                    "content": new_content,
+                    "edited_at": to_moscow(db_message.edited_at).isoformat()
+                }, room)
+
+            # === УДАЛЕНИЕ СООБЩЕНИЯ (только своё) ===
+            elif action == "delete":
+                message_id = data.get("message_id")
+                if not message_id:
+                    continue
+
+                db_message = db.query(Message).filter(Message.id == message_id, Message.room_id == room).first()
+                if not db_message:
+                    await websocket.send_json({"type": "error", "content": "Сообщение не найдено"})
+                    continue
+
+                if db_message.sender_id != current_user.id:
+                    await websocket.send_json({"type": "error", "content": "Нельзя удалить чужое сообщение"})
+                    continue
+
+                db.delete(db_message)
+                db.commit()
+
+                await manager.broadcast({
+                    "type": "message_deleted",
+                    "id": message_id
+                }, room)
+
+            else:
+                await websocket.send_json({"type": "error", "content": "Неизвестное действие"})
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket: User {current_user.username} disconnected from room {room}")
