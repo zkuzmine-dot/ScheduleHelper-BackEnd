@@ -1113,6 +1113,47 @@ async def delete_schedule(
     db.commit()
     return {"message": f"Schedule {schedule_id} deleted successfully"}
 
+EVENT_TYPE_EMOJI = {
+    "Тест": "📝",
+    "Контрольная": "📋",
+    "Экзамен": "🎓",
+    "Другое": "📌",
+}
+
+async def notify_group_chat_about_event(db_event: "Event", db: Session):
+    """Отправляет в групповой чат системное сообщение о новом событии"""
+    room_id = f"group:{db_event.group_number}"
+    room_key = get_or_create_room_key(room_id, db)
+
+    emoji = EVENT_TYPE_EMOJI.get(db_event.event_type, "📌")
+    event_date_str = to_moscow(db_event.start_datetime).strftime("%d.%m.%Y в %H:%M")
+    notify_content = f"{emoji} Новое событие: {db_event.event_type}\n«{db_event.title}»\n🗓 {event_date_str}"
+    if db_event.description:
+        notify_content += f"\n\n{db_event.description}"
+
+    notify_message = Message(
+        room_id=room_id,
+        sender_id=None,
+        sender_username="Система",
+        content=encrypt_content(notify_content, room_key),
+        is_encrypted=True
+    )
+    db.add(notify_message)
+    db.commit()
+    db.refresh(notify_message)
+
+    await manager.broadcast({
+        "type": "message",
+        "id": notify_message.id,
+        "room_id": room_id,
+        "sender_id": None,
+        "sender_username": "Система",
+        "sender_full_name": "Система",
+        "content": notify_content,
+        "created_at": to_moscow(notify_message.created_at).isoformat()
+    }, room_id)
+
+
 @app.post("/events/", response_model=EventResponse)
 async def create_event(event: EventCreate, current_user: UserDB = Depends(get_current_admin_teacher_or_leader), db: Session = Depends(get_db)):
     try:
@@ -1132,6 +1173,10 @@ async def create_event(event: EventCreate, current_user: UserDB = Depends(get_cu
     db.add(db_event)
     db.commit()
     db.refresh(db_event)
+
+    # ====================== УВЕДОМЛЕНИЕ В ГРУППОВОЙ ЧАТ ======================
+    if db_event.group_number:
+        await notify_group_chat_about_event(db_event, db)
 
     start_datetime_moscow_response = to_moscow(db_event.start_datetime)
     return EventResponse(
